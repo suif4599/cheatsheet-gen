@@ -16,6 +16,7 @@ def gen_cheatsheet(
     target_pages: int,
     page_ranges: str,
     safe_split_ratio: float,
+    safe_cut_ratio: float,
 ):
     old_page_ranges_list: dict[int, tuple[int, int]] = {}
     page_no = 0
@@ -52,8 +53,13 @@ def gen_cheatsheet(
         input_pages.append(old_input_pages[page_no - 1])
         if page_no in old_page_ranges_list:
             page_ranges_list[len(input_pages)] = old_page_ranges_list[page_no]
+
+    # Calculate effective y_limit based on safe_cut_ratio
+    # safe_cut_ratio is relative to the height that would be cut off by y_limit
+    effective_y_limit = y_limit + (1 - y_limit) * safe_cut_ratio
+
     for svg_file in input_pages:
-        split_svg(svg_file, svg_file, None, y_limit)
+        split_svg(svg_file, svg_file, None, effective_y_limit)
     svg2pdf(svg_dir, output_pdf, page_size, "horizontal")
     available_rows = [input_rows] * len(input_pages)
     for page_no, (start, end) in page_ranges_list.items():
@@ -82,7 +88,7 @@ def gen_cheatsheet(
     if orientation == "horizontal":
         total_height, total_width = total_width, total_height
     input_width, input_height = pdf_size(input_pdf)
-    strip_ratio = input_height * y_limit / input_rows / input_width
+    strip_ratio = input_height * effective_y_limit / input_rows / input_width
     cols = 1
     rows = -1
     while True:
@@ -95,7 +101,7 @@ def gen_cheatsheet(
     print(f"Need {cols} columns to fit {len(input_pages)} pages into {target_pages} {orientation} pages.")
 
     original_pages_count = len(input_pages)
-    blank_height = input_height * y_limit
+    blank_height = input_height * effective_y_limit
     blank_width = input_width
     blank_digits = max(3, len(str(original_pages_count)))
     for page_no in range(1, original_pages_count + 1):

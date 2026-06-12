@@ -68,6 +68,16 @@ def build_parser() -> argparse.ArgumentParser:
             "on the previous page; negative values keep extra content on the next page."
         ),
     )
+    parser.add_argument(
+        "--safe-cut-ratio", "-c",
+        type=float,
+        default=0.5,
+        help=(
+            "Ratio of the bottom strip (cut by y-limit) to preserve, in the range [0, 1]. "
+            "This allows keeping more content from the bottom of each page by adjusting "
+            "the effective cut position relative to the discarded strip height."
+        ),
+    )
     return parser
 
 
@@ -85,6 +95,7 @@ def main() -> None:
             args.target_pages,
             args.page_ranges,
             args.safe_split_ratio,
+            args.safe_cut_ratio,
         )
 
 # python main.py --page-ranges ":-3;:0;:-4;:-2;6=:-4" "复习.pdf"
