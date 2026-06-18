@@ -104,6 +104,37 @@ def split_svg(input_svg: Path | str, up_path: Path | str | None, down_path: Path
 		ET.ElementTree(down_root).write(down_path, encoding="utf-8", xml_declaration=True)
 
 
+def scale_svg_vertical(svg_path: Path | str, factor: float) -> Path:
+	"""Scale an SVG's content vertically by ``factor``, in place.
+
+	The width is unchanged; the height becomes ``height * factor`` and the
+	content is squished or stretched with a pure vector transform (no
+	rasterization). ``factor`` of 0.9 compresses every row to 90% of its
+	height. Because all downstream cuts are expressed as fractions of the
+	page, they remain valid after this scaling.
+	"""
+	if factor <= 0:
+		raise ValueError("factor 必须大于 0")
+	svg_path = Path(svg_path)
+	root = _get_root(svg_path)
+	x, y, width, height = _read_viewport(root)
+
+	new_height = height * factor
+	# Wrap the existing content in a group scaled about the viewport's top
+	# edge (y), so a point py maps to y + (py - y) * factor.
+	group = ET.Element(f"{{{SVG_NS}}}g")
+	group.set("transform", f"translate(0 {y * (1 - factor)}) scale(1 {factor})")
+	for child in list(root):
+		group.append(child)
+	root.append(group)
+
+	root.set("viewBox", f"{x} {y} {width} {new_height}")
+	root.set("width", f"{width}")
+	root.set("height", f"{new_height}")
+	ET.ElementTree(root).write(svg_path, encoding="utf-8", xml_declaration=True)
+	return svg_path
+
+
 def concat_svg(
 	first_svg: Path | str,
 	second_svg: Path | str,

@@ -3,7 +3,7 @@ from typing import Literal
 import re
 
 from utils.pdf import svg2pdf, pdf2svg, parse_page_size, pdf_size
-from utils.svg import split_svg, concat_svg, empty_svg
+from utils.svg import split_svg, concat_svg, empty_svg, scale_svg_vertical
 
 def gen_cheatsheet(
     input_pdf: Path,
@@ -17,7 +17,10 @@ def gen_cheatsheet(
     page_ranges: str,
     safe_split_ratio: float,
     safe_cut_ratio: float,
+    y_scale: float,
 ):
+    if not (0 < y_scale <= 1):
+        raise ValueError(f"y_scale 必须在 (0, 1] 范围内，当前为 {y_scale}")
     old_page_ranges_list: dict[int, tuple[int, int]] = {}
     page_no = 0
     for page_range in page_ranges.split(";"):
@@ -72,6 +75,13 @@ def gen_cheatsheet(
     effective_y_limit = y_limit + (1 - y_limit) * safe_cut_ratio
     extra_rows = input_rows * (effective_y_limit - y_limit) / y_limit
 
+    # Compress every row vertically by `y_scale` via a vector transform. All
+    # cuts below are fractions of the page, so they are unaffected; only the
+    # absolute row height (and thus strip_ratio / blank_height) changes.
+    if y_scale != 1.0:
+        for svg_file in input_pages:
+            scale_svg_vertical(svg_file, y_scale)
+
     # Keep the retained region [0, effective_y_limit] of every page.
     for svg_file in input_pages:
         split_svg(svg_file, svg_file, None, effective_y_limit)
@@ -80,35 +90,58 @@ def gen_cheatsheet(
     # strip. A ranged page contributes only the rows inside its range, plus the
     # extra strip only when the range reaches the bottom of the page.
     available_rows: list[float] = [input_rows + extra_rows] * len(input_pages)
+    # `safe_split_ratio` has a second meaning for page-range cuts: it extends a
+    # range slightly past its real-row boundary so the cut shows a sliver of the
+    # neighbouring row as context. A positive value extends the BOTTOM cut
+    # downward (the last row pulls in part of the row below it); a negative
+    # value extends the TOP cut upward (the first row pulls in part of the row
+    # above it). The extension is |safe_split_ratio| standard rows and only
+    # applies where a neighbouring real row exists — the page bottom uses the
+    # safe_cut extra strip instead, never this. This is independent of the
+    # column-switch overlap behaviour in the stitching loop below.
+    extra_down = max(safe_split_ratio, 0.0)   # extends the bottom cut downward
+    extra_up = max(-safe_split_ratio, 0.0)    # extends the top cut upward
     for page_no, (start, end) in page_ranges_list.items():
         if page_no < 1 or page_no > len(input_pages):
             raise ValueError(f"Page number {page_no} is out of range (1-{len(input_pages)})")
-        if end >= input_rows:
-            available_rows[page_no - 1] = (input_rows - start) + extra_rows
+        # Retained region in row units is [lo, hi]. Real rows occupy [0, y_limit],
+        # i.e. the top `y_limit / effective_y_limit` fraction of the retained
+        # page, so a row position r maps to the fraction
+        # `r / input_rows * y_limit / effective_y_limit` of the page. The bottom
+        # cut is applied first so the two cuts reference the same page and do
+        # not compound (which previously stretched interior ranges such as "2:3").
+        page = input_pages[page_no - 1]
+        bottom_cut = end < input_rows
+        if bottom_cut:
+            hi = end + extra_down
+            split_svg(page, page, None, hi / input_rows * y_limit / effective_y_limit)
         else:
-            available_rows[page_no - 1] = end - start
+            # Range reaches the page bottom: keep full real rows + extra strip.
+            # No bottom extension here (no real row below to pull from).
+            hi = input_rows + extra_rows
+        if start > 0:
+            lo = start - extra_up
+            if lo > 0:
+                if bottom_cut:
+                    # Page now spans rows [0, hi], so cut at lo / hi.
+                    split_svg(page, None, page, lo / hi)
+                else:
+                    split_svg(page, None, page, lo / input_rows * y_limit / effective_y_limit)
+            else:
+                lo = 0.0
+        else:
+            lo = 0.0
+        available_rows[page_no - 1] = hi - lo
         if available_rows[page_no - 1] <= 0:
             raise ValueError(f"Invalid row range for page {page_no}: start={start}, end={end}")
-        # Crop to the real rows [start, end]. Real rows live in [0, y_limit],
-        # i.e. the top `y_limit / effective_y_limit` fraction of the retained
-        # page, so every cut position is scaled by that factor. The bottom cut
-        # is applied first so the two cuts reference the same page and do not
-        # compound (which previously stretched interior ranges such as "2:3").
-        page = input_pages[page_no - 1]
-        if end < input_rows:
-            split_svg(page, page, None, end / input_rows * y_limit / effective_y_limit)
-            if start > 0:
-                split_svg(page, None, page, start / end)
-        elif start > 0:
-            split_svg(page, None, page, start / input_rows * y_limit / effective_y_limit)
     input_strips = sum(available_rows)
 
     total_width, total_height = parse_page_size(page_size)
     if orientation == "horizontal":
         total_height, total_width = total_width, total_height
     input_width, input_height = pdf_size(input_pdf)
-    # One strip is exactly one real row.
-    strip_ratio = input_height * y_limit / input_rows / input_width
+    # One strip is exactly one real row, scaled vertically by `y_scale`.
+    strip_ratio = input_height * y_limit / input_rows / input_width * y_scale
     cols = 1
     rows = -1
     while True:
@@ -133,7 +166,7 @@ def gen_cheatsheet(
 
     original_pages_count = len(input_pages)
     # A blank fills `input_rows` strips (real rows), matching the grid cell.
-    blank_height = input_height * y_limit
+    blank_height = input_height * y_limit * y_scale
     blank_width = input_width
     blank_digits = max(3, len(str(original_pages_count)))
     for page_no in range(1, original_pages_count + 1):
@@ -151,40 +184,26 @@ def gen_cheatsheet(
             row_tmp: Path | None = None
             while True:
                 if current_rows + this_page_rows > rows:
-                    # Need to split
-                    if safe_split_ratio == 0:
-                        split_svg(
-                            input_pages[current_page_index],
-                            svg_dir / "up.svg",
-                            input_pages[current_page_index],
-                            1 - (current_rows + this_page_rows - rows) / this_page_rows,
-                        )
+                    # Need to split: keep `keep` rows in this column and send
+                    # the remaining `spill` rows to the next column.
+                    keep = rows - current_rows
+                    page_rows = this_page_rows
+                    spill = page_rows - keep
+                    page = input_pages[current_page_index]
+                    if safe_split_ratio == 0 or abs(safe_split_ratio) >= spill:
+                        # No overlap, or the spillover is too small to fit one:
+                        # plain split at the real boundary.
+                        split_svg(page, svg_dir / "up.svg", page, keep / page_rows)
                     elif safe_split_ratio > 0:
-                        split_svg(
-                            input_pages[current_page_index],
-                            svg_dir / "up.svg",
-                            None,
-                            1 - (current_rows + this_page_rows - rows) / this_page_rows + safe_split_ratio / this_page_rows,
-                        )
-                        split_svg(
-                            input_pages[current_page_index],
-                            None,
-                            input_pages[current_page_index],
-                            1 - (current_rows + this_page_rows - rows) / this_page_rows,
-                        )
+                        # Positive overlap: the boundary rows appear in both
+                        # this column (end) and the next column (start).
+                        split_svg(page, svg_dir / "up.svg", None, (keep + safe_split_ratio) / page_rows)
+                        split_svg(page, None, page, keep / page_rows)
                     else:
-                        split_svg(
-                            input_pages[current_page_index],
-                            svg_dir / "up.svg",
-                            None,
-                            1 - (current_rows + this_page_rows - rows) / this_page_rows,
-                        )
-                        split_svg(
-                            input_pages[current_page_index],
-                            None,
-                            input_pages[current_page_index],
-                            1 - (current_rows + this_page_rows - rows) / this_page_rows - safe_split_ratio / this_page_rows,
-                        )
+                        # Negative overlap: skip |safe_split_ratio| rows at the
+                        # boundary (a small gap between the two columns).
+                        split_svg(page, svg_dir / "up.svg", None, keep / page_rows)
+                        split_svg(page, None, page, (keep - safe_split_ratio) / page_rows)
                     if row_tmp is not None:
                         concat_svg(
                             row_tmp,

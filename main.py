@@ -64,8 +64,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.3,
         help=(
-            "Split overlap ratio in the range [-1, 1]. Positive values keep extra content "
-            "on the previous page; negative values keep extra content on the next page."
+            "Overlap ratio in [-1, 1] with two effects. (1) When stitching across "
+            "columns, a positive value overlaps the boundary rows into the current "
+            "column and a negative value leaves a small gap. (2) When a page range is "
+            "cut between real rows, a positive value extends the bottom cut down by "
+            "this fraction of a row (showing part of the next row) and a negative "
+            "value extends the top cut up by this fraction of a row (showing part of "
+            "the previous row)."
         ),
     )
     parser.add_argument(
@@ -76,6 +81,17 @@ def build_parser() -> argparse.ArgumentParser:
             "Ratio of the bottom strip (cut by y-limit) to preserve, in the range [0, 1]. "
             "This allows keeping more content from the bottom of each page by adjusting "
             "the effective cut position relative to the discarded strip height."
+        ),
+    )
+    parser.add_argument(
+        "--y-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Vertical compression applied to every row via a vector transform, in the "
+            "range (0, 1]. For example, 0.9 squishes each row to 90%% of its height so "
+            "more rows fit per page while keeping the content fully vector. Default 1.0 "
+            "(no compression)."
         ),
     )
     return parser
@@ -96,6 +112,7 @@ def main() -> None:
             args.page_ranges,
             args.safe_split_ratio,
             args.safe_cut_ratio,
+            args.y_scale,
         )
 
 # python main.py --page-ranges ":-3;:0;:-4;:-2;6=:-4" "复习.pdf"
