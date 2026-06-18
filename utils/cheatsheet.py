@@ -21,10 +21,13 @@ def gen_cheatsheet(
     old_page_ranges_list: dict[int, tuple[int, int]] = {}
     page_no = 0
     for page_range in page_ranges.split(";"):
+        page_range = page_range.strip()
+        if not page_range:
+            continue
         page_no += 1
         if "=" not in page_range:
             page_range = f"{page_no}={page_range}"
-        match = re.match(r"(\d+)=(-?\d*):(-?\d*)", page_range.strip())
+        match = re.match(r"(\d+)=(-?\d*):(-?\d*)", page_range)
         if not match:
             raise ValueError(f"Invalid page range format: {page_range}")
         page_no = int(match.group(1))
@@ -54,41 +57,58 @@ def gen_cheatsheet(
         if page_no in old_page_ranges_list:
             page_ranges_list[len(input_pages)] = old_page_ranges_list[page_no]
 
-    # Calculate effective y_limit based on safe_cut_ratio
-    # safe_cut_ratio is relative to the height that would be cut off by y_limit
+    # --- Geometry model -------------------------------------------------------
+    # Each input page physically holds `input_rows` real content rows that
+    # evenly occupy the top `y_limit` fraction of the page. One real row is
+    # therefore `y_limit * input_height / input_rows` tall, and that real row
+    # is the atomic "strip" unit used for every cut and every grid cell below.
+    #
+    # `safe_cut_ratio` keeps a fraction of the bottom strip that `y_limit`
+    # would otherwise discard, so the retained region grows from `y_limit` to
+    # `effective_y_limit`. That extra bottom strip is genuine (overflow)
+    # content: it is *not* one of the `input_rows` rows, so it is accounted for
+    # as a fractional number of extra rows (`extra_rows`) attached to any page
+    # whose range reaches the bottom.
     effective_y_limit = y_limit + (1 - y_limit) * safe_cut_ratio
+    extra_rows = input_rows * (effective_y_limit - y_limit) / y_limit
 
+    # Keep the retained region [0, effective_y_limit] of every page.
     for svg_file in input_pages:
         split_svg(svg_file, svg_file, None, effective_y_limit)
-    svg2pdf(svg_dir, output_pdf, page_size, "horizontal")
-    available_rows = [input_rows] * len(input_pages)
+
+    # A full page contributes its `input_rows` real rows plus the extra bottom
+    # strip. A ranged page contributes only the rows inside its range, plus the
+    # extra strip only when the range reaches the bottom of the page.
+    available_rows: list[float] = [input_rows + extra_rows] * len(input_pages)
     for page_no, (start, end) in page_ranges_list.items():
         if page_no < 1 or page_no > len(input_pages):
             raise ValueError(f"Page number {page_no} is out of range (1-{len(input_pages)})")
-        available_rows[page_no - 1] = end - start
+        if end >= input_rows:
+            available_rows[page_no - 1] = (input_rows - start) + extra_rows
+        else:
+            available_rows[page_no - 1] = end - start
         if available_rows[page_no - 1] <= 0:
             raise ValueError(f"Invalid row range for page {page_no}: start={start}, end={end}")
-        if start > 0:
-            split_svg(
-                input_pages[page_no - 1],
-                None,
-                input_pages[page_no - 1],
-                start / input_rows,
-            )
+        # Crop to the real rows [start, end]. Real rows live in [0, y_limit],
+        # i.e. the top `y_limit / effective_y_limit` fraction of the retained
+        # page, so every cut position is scaled by that factor. The bottom cut
+        # is applied first so the two cuts reference the same page and do not
+        # compound (which previously stretched interior ranges such as "2:3").
+        page = input_pages[page_no - 1]
         if end < input_rows:
-            split_svg(
-                input_pages[page_no - 1],
-                input_pages[page_no - 1],
-                None,
-                end / input_rows,
-            )
+            split_svg(page, page, None, end / input_rows * y_limit / effective_y_limit)
+            if start > 0:
+                split_svg(page, None, page, start / end)
+        elif start > 0:
+            split_svg(page, None, page, start / input_rows * y_limit / effective_y_limit)
     input_strips = sum(available_rows)
 
     total_width, total_height = parse_page_size(page_size)
     if orientation == "horizontal":
         total_height, total_width = total_width, total_height
     input_width, input_height = pdf_size(input_pdf)
-    strip_ratio = input_height * effective_y_limit / input_rows / input_width
+    # One strip is exactly one real row.
+    strip_ratio = input_height * y_limit / input_rows / input_width
     cols = 1
     rows = -1
     while True:
@@ -99,9 +119,21 @@ def gen_cheatsheet(
             break
         cols += 1
     print(f"Need {cols} columns to fit {len(input_pages)} pages into {target_pages} {orientation} pages.")
+    cap = rows * cols * target_pages
+    if cols > 1:
+        rows_prev = int(total_height / (total_width / (cols - 1) * strip_ratio))
+        cap_prev = rows_prev * (cols - 1) * target_pages
+        print(
+            f"  Capacity: {cols} columns ≈ {cap} standard rows ({rows}/col), "
+            f"{cols - 1} columns ≈ {cap_prev} standard rows ({rows_prev}/col); "
+            f"content ≈ {input_strips:.1f} rows."
+        )
+    else:
+        print(f"  Capacity: {cols} column ≈ {cap} standard rows; content ≈ {input_strips:.1f} rows.")
 
     original_pages_count = len(input_pages)
-    blank_height = input_height * effective_y_limit
+    # A blank fills `input_rows` strips (real rows), matching the grid cell.
+    blank_height = input_height * y_limit
     blank_width = input_width
     blank_digits = max(3, len(str(original_pages_count)))
     for page_no in range(1, original_pages_count + 1):
@@ -202,7 +234,7 @@ def gen_cheatsheet(
             raise ValueError("Unexpected error: col_tmp should not be None here")
         page_tmp = svg_dir / f"page_{page_no:03d}.svg"
         col_tmp.rename(page_tmp)
-    
+
     for temp_file in input_pages + list(svg_dir.glob("row_tmp.svg")) + list(svg_dir.glob("col_tmp.svg")) + list(svg_dir.glob("up.svg")):
         if temp_file.exists():
             temp_file.unlink()
