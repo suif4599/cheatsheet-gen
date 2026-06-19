@@ -66,11 +66,15 @@ def svg2pdf(
 	output: Path,
 	page: str = "A4",
 	orientation: Literal["horizontal", "vertical"] = "vertical",
+	on_page: Callable[[], None] | None = None,
 ) -> None:
 	"""Convert sorted SVG files in a directory to a multi-page vector PDF.
 
 	Each SVG becomes one page. SVG content is uniformly scaled to fit the page
 	while preserving aspect ratio, and centered on the page.
+
+	``on_page``, if given, is invoked (with no arguments) after each page is
+	rendered, so a caller can drive a progress bar. It does not affect output.
 	"""
 	if not svg_dir.exists() or not svg_dir.is_dir():
 		raise ValueError(f"svg_dir 不存在或不是目录: {svg_dir}")
@@ -120,6 +124,8 @@ def svg2pdf(
 		renderPDF.draw(drawing, pdf, 0, 0)
 		pdf.restoreState()
 		pdf.showPage()
+		if on_page is not None:
+			on_page()
 
 	pdf.save()
 

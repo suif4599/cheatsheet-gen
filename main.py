@@ -86,12 +86,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--y-scale",
         type=float,
-        default=1.0,
+        default=None,
         help=(
             "Vertical compression applied to every row via a vector transform, in the "
-            "range (0, 1]. For example, 0.9 squishes each row to 90%% of its height so "
-            "more rows fit per page while keeping the content fully vector. Default 1.0 "
-            "(no compression)."
+            "range (0, 1]. E.g. 0.9 squishes each row to 90%% of its height so more rows "
+            "fit per page while keeping the content fully vector. If omitted, after the "
+            "layout is solved the program checks whether a modest auto-detected "
+            "compression would fit the content into one fewer column and asks before "
+            "applying it; pass 1.0 explicitly to skip that check."
         ),
     )
     return parser

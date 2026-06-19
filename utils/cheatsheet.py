@@ -1,6 +1,8 @@
 from pathlib import Path
 from typing import Literal
 import re
+import shutil
+from tqdm import tqdm
 
 from utils.pdf import svg2pdf, pdf2svg, parse_page_size, pdf_size
 from utils.svg import split_svg, concat_svg, empty_svg, scale_svg_vertical
@@ -17,9 +19,9 @@ def gen_cheatsheet(
     page_ranges: str,
     safe_split_ratio: float,
     safe_cut_ratio: float,
-    y_scale: float,
+    y_scale: float | None,
 ):
-    if not (0 < y_scale <= 1):
+    if y_scale is not None and not (0 < y_scale <= 1):
         raise ValueError(f"y_scale 必须在 (0, 1] 范围内，当前为 {y_scale}")
     old_page_ranges_list: dict[int, tuple[int, int]] = {}
     page_no = 0
@@ -78,7 +80,11 @@ def gen_cheatsheet(
     # Compress every row vertically by `y_scale` via a vector transform. All
     # cuts below are fractions of the page, so they are unaffected; only the
     # absolute row height (and thus strip_ratio / blank_height) changes.
-    if y_scale != 1.0:
+    # Scaling is skipped here when y_scale is left to "auto" (None); it is
+    # applied later, after the layout-driven auto-detection. The order does not
+    # matter: every cut is a fraction of the page and vertical scaling is
+    # uniform, so the two commute.
+    if y_scale is not None and y_scale != 1.0:
         for svg_file in input_pages:
             scale_svg_vertical(svg_file, y_scale)
 
@@ -140,19 +146,29 @@ def gen_cheatsheet(
     if orientation == "horizontal":
         total_height, total_width = total_width, total_height
     input_width, input_height = pdf_size(input_pdf)
-    # One strip is exactly one real row, scaled vertically by `y_scale`.
-    strip_ratio = input_height * y_limit / input_rows / input_width * y_scale
-    cols = 1
-    rows = -1
-    while True:
-        strip_height = total_width / cols * strip_ratio
-        rows = int(total_height / strip_height)
-        available_strips = rows * cols * target_pages
-        if available_strips >= input_strips:
-            break
-        cols += 1
+
+    # `compute_layout(ys)` returns the smallest column count (and rows-per-column
+    # it yields) needed to fit `input_strips` when every row is compressed
+    # vertically by `ys`. Pure arithmetic, so the auto-detection below can probe
+    # many candidate scales cheaply.
+    def compute_layout(ys: float) -> tuple[int, int]:
+        sr = input_height * y_limit / input_rows / input_width * ys
+        c = 1
+        while True:
+            r = int(total_height / (total_width / c * sr))
+            if r * c * target_pages >= input_strips:
+                return c, r
+            c += 1
+
+    # Solve the layout at the provisional scale: the user's value if given,
+    # otherwise 1.0 (no compression) while we decide whether to auto-compress.
+    auto_mode = y_scale is None
+    prov_ys = 1.0 if auto_mode else y_scale
+    strip_ratio = input_height * y_limit / input_rows / input_width * prov_ys
+    cols, rows = compute_layout(prov_ys)
     print(f"Need {cols} columns to fit {len(input_pages)} pages into {target_pages} {orientation} pages.")
     cap = rows * cols * target_pages
+    cap_prev = 0
     if cols > 1:
         rows_prev = int(total_height / (total_width / (cols - 1) * strip_ratio))
         cap_prev = rows_prev * (cols - 1) * target_pages
@@ -164,78 +180,156 @@ def gen_cheatsheet(
     else:
         print(f"  Capacity: {cols} column ≈ {cap} standard rows; content ≈ {input_strips:.1f} rows.")
 
-    original_pages_count = len(input_pages)
-    # A blank fills `input_rows` strips (real rows), matching the grid cell.
+    # Auto y_scale: when none was supplied, check whether a modest vertical
+    # compression would let the content drop into one fewer column (wider, more
+    # readable columns). Only attempt when the content overflows the (cols-1)
+    # capacity by less than 30 %; then probe a scale and fine-tune at 0.01
+    # precision to the *largest* scale that still fits cols-1 (least
+    # compression), and ask before applying it.
+    if auto_mode and cols >= 2:
+        overflow = (input_strips - cap_prev) / cap_prev
+        if overflow < 0.30:
+            probe = cap_prev / input_strips  # ~= 1 / (1 + overflow)
+            c = max(1, min(100, round(probe * 100)))
+            while c >= 1 and compute_layout(c / 100)[0] > cols - 1:
+                c -= 1
+            while c + 1 <= 100 and compute_layout((c + 1) / 100)[0] <= cols - 1:
+                c += 1
+            if c >= 1 and c / 100 < 1.0:
+                fewer = cols - 1
+                plural = "" if fewer == 1 else "s"
+                try:
+                    ans = input(
+                        f"  Auto y_scale {c / 100:.2f} fits the content into {fewer} column{plural} "
+                        f"(was {cols}; overflow {overflow * 100:.1f}%). Apply? [Y/n] "
+                    ).strip().lower()
+                except EOFError:
+                    ans = "n"
+                if ans in ("", "y", "yes"):
+                    y_scale = c / 100
+    if y_scale is None:
+        y_scale = 1.0
+
+    # For an auto-detected (and accepted) compression, apply the vector scaling
+    # now and re-solve the layout at the chosen scale. Explicit scales were
+    # already applied before the cuts; the two commute (see the note above).
+    if auto_mode and y_scale != 1.0:
+        for svg_file in input_pages:
+            scale_svg_vertical(svg_file, y_scale)
+        strip_ratio = input_height * y_limit / input_rows / input_width * y_scale
+        cols, rows = compute_layout(y_scale)
+        print(f"  -> using y_scale {y_scale:.2f}: {cols} columns, {rows} rows/col.")
+
+    # --- Grid stitching -------------------------------------------------------
+    # The grid has `cols` x `rows` cells per output page across `target_pages`.
+    # Real input pages are consumed first; any leftover cells are filled with a
+    # SINGLE blank image (`blank.svg`) referenced as many times as needed, so the
+    # fill never runs short no matter how large `cols` (and thus the N^2-style
+    # capacity jump) gets.
     blank_height = input_height * y_limit * y_scale
     blank_width = input_width
-    blank_digits = max(3, len(str(original_pages_count)))
-    for page_no in range(1, original_pages_count + 1):
-        blank_path = svg_dir / f"blank_{page_no:0{blank_digits}d}.svg"
-        input_pages.append(empty_svg(blank_width, blank_height, blank_path))
-    available_rows += [input_rows] * original_pages_count
+    blank_svg = empty_svg(blank_width, blank_height, svg_dir / "blank.svg")
+    real_pages_count = len(input_pages)
 
+    def page_file(idx: int) -> Path:
+        # A real page, or the single blank for every slot beyond the real ones.
+        return input_pages[idx] if idx < real_pages_count else blank_svg
+
+    def page_rows_at(idx: int) -> float:
+        return available_rows[idx] if idx < real_pages_count else input_rows
+
+    def count_segments() -> int:
+        # Dry run of the placement arithmetic below (no file I/O) to count
+        # exactly how many segments the stitching loop will place, so the
+        # progress bar can be determinate. This must mirror the loop's branch
+        # and carry logic one-to-one; the two are kept adjacent on purpose.
+        idx = 0
+        cur = page_rows_at(0)
+        total = 0
+        for _ in range(target_pages * cols):
+            fill = 0
+            while fill < rows:
+                if fill + cur <= rows:
+                    total += 1
+                    fill += cur
+                    idx += 1
+                    cur = page_rows_at(idx)
+                else:
+                    total += 1
+                    cur = cur - (rows - fill)
+                    fill = rows
+        return total
+
+    stitch_bar = tqdm(total=count_segments(), desc="Stitching", unit="seg")
     current_page_index = 0
-    this_page_rows = available_rows[0]
-    page_tmp: Path | None = None
+    current_page_path = page_file(0)
+    this_page_rows = page_rows_at(0)
     for page_no in range(1, target_pages + 1):
         col_tmp: Path | None = None
         for col in range(1, cols + 1):
             current_rows = 0
             row_tmp: Path | None = None
-            while True:
-                if current_rows + this_page_rows > rows:
-                    # Need to split: keep `keep` rows in this column and send
-                    # the remaining `spill` rows to the next column.
-                    keep = rows - current_rows
-                    page_rows = this_page_rows
-                    spill = page_rows - keep
-                    page = input_pages[current_page_index]
-                    if safe_split_ratio == 0 or abs(safe_split_ratio) >= spill:
-                        # No overlap, or the spillover is too small to fit one:
-                        # plain split at the real boundary.
-                        split_svg(page, svg_dir / "up.svg", page, keep / page_rows)
-                    elif safe_split_ratio > 0:
-                        # Positive overlap: the boundary rows appear in both
-                        # this column (end) and the next column (start).
-                        split_svg(page, svg_dir / "up.svg", None, (keep + safe_split_ratio) / page_rows)
-                        split_svg(page, None, page, keep / page_rows)
-                    else:
-                        # Negative overlap: skip |safe_split_ratio| rows at the
-                        # boundary (a small gap between the two columns).
-                        split_svg(page, svg_dir / "up.svg", None, keep / page_rows)
-                        split_svg(page, None, page, (keep - safe_split_ratio) / page_rows)
+            while current_rows < rows:
+                if current_rows + this_page_rows <= rows:
+                    # The whole current page fits in this column.
                     if row_tmp is not None:
                         concat_svg(
                             row_tmp,
-                            svg_dir / "up.svg",
+                            current_page_path,
                             row_tmp,
                             orientation="vertical",
                             draw_separator=False,
                         )
                     else:
+                        # First piece of the column: copy rather than move,
+                        # since the source may be the shared blank referenced
+                        # again later.
                         row_tmp = svg_dir / "row_tmp.svg"
-                        (svg_dir / "up.svg").rename(row_tmp)
-                    this_page_rows = current_rows + available_rows[current_page_index] - rows
-                    break
-                # No split needed, just concatenate
-                if row_tmp is not None:
-                    concat_svg(
-                        row_tmp,
-                        input_pages[current_page_index],
-                        row_tmp,
-                        orientation="vertical",
-                        draw_separator=False,
-                    )
+                        shutil.copyfile(current_page_path, row_tmp)
+                    current_rows += this_page_rows
+                    current_page_index += 1
+                    current_page_path = page_file(current_page_index)
+                    this_page_rows = page_rows_at(current_page_index)
                 else:
-                    row_tmp = svg_dir / "row_tmp.svg"
-                    input_pages[current_page_index].rename(row_tmp)
-                current_rows += this_page_rows
-                current_page_index += 1
-                if current_page_index >= len(input_pages):
-                    raise ValueError("Not enough input pages to fill the target pages with the given page ranges.")
-                this_page_rows = available_rows[current_page_index]
-                if current_rows >= rows:
-                    break
+                    # Split: keep `keep` rows here and send the remaining
+                    # `spill` rows to the next column. The split always writes
+                    # to fresh `up`/`rem` files, so the source page (and the
+                    # shared blank) is only ever read, never mutated.
+                    keep = rows - current_rows
+                    page_rows = this_page_rows
+                    spill = page_rows - keep
+                    up = svg_dir / "up.svg"
+                    rem = svg_dir / "rem.svg"
+                    if safe_split_ratio == 0 or abs(safe_split_ratio) >= spill:
+                        # No overlap, or the spillover is too small to fit one:
+                        # plain split at the real boundary.
+                        split_svg(current_page_path, up, rem, keep / page_rows)
+                    elif safe_split_ratio > 0:
+                        # Positive overlap: the boundary rows appear in both
+                        # this column (end) and the next column (start).
+                        split_svg(current_page_path, up, None, (keep + safe_split_ratio) / page_rows)
+                        split_svg(current_page_path, None, rem, keep / page_rows)
+                    else:
+                        # Negative overlap: skip |safe_split_ratio| rows at the
+                        # boundary (a small gap between the two columns).
+                        split_svg(current_page_path, up, None, keep / page_rows)
+                        split_svg(current_page_path, None, rem, (keep - safe_split_ratio) / page_rows)
+                    if row_tmp is not None:
+                        concat_svg(
+                            row_tmp,
+                            up,
+                            row_tmp,
+                            orientation="vertical",
+                            draw_separator=False,
+                        )
+                        up.unlink()
+                    else:
+                        row_tmp = svg_dir / "row_tmp.svg"
+                        up.rename(row_tmp)
+                    current_rows = rows
+                    current_page_path = rem
+                    this_page_rows = spill
+                stitch_bar.update(1)
             if row_tmp is None:
                 raise ValueError("Unexpected error: row_tmp should not be None here")
             if col_tmp is not None:
@@ -253,8 +347,17 @@ def gen_cheatsheet(
             raise ValueError("Unexpected error: col_tmp should not be None here")
         page_tmp = svg_dir / f"page_{page_no:03d}.svg"
         col_tmp.rename(page_tmp)
+    stitch_bar.close()
 
-    for temp_file in input_pages + list(svg_dir.glob("row_tmp.svg")) + list(svg_dir.glob("col_tmp.svg")) + list(svg_dir.glob("up.svg")):
+    for temp_file in (
+        input_pages
+        + [blank_svg]
+        + list(svg_dir.glob("row_tmp.svg"))
+        + list(svg_dir.glob("col_tmp.svg"))
+        + list(svg_dir.glob("up.svg"))
+        + list(svg_dir.glob("rem.svg"))
+    ):
         if temp_file.exists():
             temp_file.unlink()
-    svg2pdf(svg_dir, output_pdf, page_size, orientation)
+    with tqdm(total=target_pages, desc="Rendering", unit="page") as render_bar:
+        svg2pdf(svg_dir, output_pdf, page_size, orientation, on_page=render_bar.update)
